@@ -1,0 +1,846 @@
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(monocle)
+library(umap)
+library(RColorBrewer)
+library(cowplot)
+library(randomcoloR)
+library(corrplot)
+library(DoubletFinder)
+library(ggplot2)
+library(harmony)
+library(ROGUE)
+library(scRNAtoolVis)
+library(SCpubr)
+library(pheatmap)
+library(stringr)
+
+readfunction <- function(projectname, path, savename){
+  a <- Read10X(data.dir = path)
+  scRNA <- CreateSeuratObject(counts = a, min.cells = 3, min.features = 300, project = projectname)
+  scRNA[["percent.mt"]] <- PercentageFeatureSet(scRNA, pattern = "^MT-") 
+  HB.genes <- c("HBA1","HBA2","HBB","HBD","HBE1","HBG1","HBG2","HBM","HBQ1","HBZ")
+  HB_m <- match(HB.genes, rownames(scRNA@assays$RNA))
+  HB.genes <- rownames(scRNA@assays$RNA)[HB_m]
+  HB.genes <- HB.genes[!is.na(HB.genes)]
+  scRNA[["percent.HB"]] <- PercentageFeatureSet(scRNA, features = HB.genes)
+  scRNA <- subset(scRNA, subset = nFeature_RNA > 300 & nFeature_RNA < 7000 & percent.mt < 20 & percent.HB < 5 & nCount_RNA < 20000)
+  scRNA <- NormalizeData(scRNA)
+  scRNA <- ScaleData(scRNA)
+  scRNA <- FindVariableFeatures(scRNA, selection.method = "vst", nfeatures = 2000)
+  scRNA <- RunPCA(scRNA)
+  scRNA <- FindNeighbors(scRNA, dims = 1:10)
+  scRNA <- FindClusters(scRNA)
+  scRNA <- RunUMAP(scRNA, dims = 1:10)
+  
+  sweep.res.list_kidney <- paramSweep_v3(scRNA, PCs = 1:20, sct = F)
+  sweep.stats_kidney <- summarizeSweep(sweep.res.list_kidney, GT = FALSE)
+  bcmvn_kidney <- find.pK(sweep.stats_kidney)
+  mpK <- as.numeric(as.vector(bcmvn_kidney$pK[which.max(bcmvn_kidney$BCmetric)]))
+ 
+  annotations <- scRNA@meta.data$seurat_clusters
+  homotypic.prop <- modelHomotypic(annotations)
+  DoubletRate = ncol(scRNA)*8 * 1e-6
+  nExp_poi <- round(DoubletRate*ncol(scRNA@assays$RNA@data))
+  nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+  
+  seurat_filterDouble <- doubletFinder_v3(scRNA, PCs = 1:50, pN = 0.25, pK = mpK, nExp = nExp_poi, reuse.pANN = FALSE, sct = F)
+  doubletdata <- seurat_filterDouble@meta.data[, ncol(seurat_filterDouble@meta.data)]
+  names(doubletdata) <- rownames(scRNA@meta.data)
+  doubletdata <- as.data.frame(doubletdata)
+  scRNA <- AddMetaData(scRNA, doubletdata)
+  table(scRNA$doubletdata)
+  saveRDS(scRNA, savename)
+}
+
+process_pSS_data <- function(pSS_hamony) {
+  pSS_hamony$donor <- pSS_hamony$orig.ident
+  pSS_hamony <- subset(pSS_hamony, doubletdata %in% "Singlet")
+  
+  s.genes <- Seurat::cc.genes.updated.2019$s.genes
+  g2m.genes <- Seurat::cc.genes.updated.2019$g2m.genes
+  
+  s.genes <- intersect(s.genes, rownames(pSS_hamony))
+  g2m.genes <- intersect(g2m.genes, rownames(pSS_hamony))
+  pSS_hamony <- CellCycleScoring(object = pSS_hamony, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+  
+  DefaultAssay(pSS_hamony) <- "RNA"
+  pSS_hamony <- NormalizeData(pSS_hamony)
+  pSS_hamony <- FindVariableFeatures(pSS_hamony, selection.method = "vst", nfeatures = 2000)
+  pSS_hamony <- ScaleData(pSS_hamony, verbose = F, vars.to.regress = c("S.Score", "G2M.Score"))
+  pSS_hamony <- RunPCA(pSS_hamony, verbose = FALSE)
+  pSS_hamony <- RunHarmony(pSS_hamony, c("orig.ident"))
+  
+  pSS_hamony <- RunUMAP(pSS_hamony, reduction = "harmony", dims = 1:20)
+  pSS_hamony <- FindNeighbors(pSS_hamony, reduction = "harmony", dims = 1:20)
+  pSS_hamony <- FindClusters(pSS_hamony, resolution = c(0.8, 1.5))
+  
+  return(pSS_hamony)
+}
+
+plot_cell_umap <- function(seurat_obj, colors, label_size = 4.5, pt_size = 0.01) {
+  DimPlot(seurat_obj, reduction = 'umap', cols = colors, repel = TRUE, 
+          label.size = label_size, label = TRUE, pt.size = pt_size, raster = FALSE) +
+    theme_dr(xlength = 0.2, ylength = 0.3, 
+             arrow = arrow(length = unit(0.2, "inches"), type = "closed")) +
+    theme(panel.grid = element_blank(), axis.title = element_text(hjust = 0.03)) +
+    NoLegend() + theme(text = element_text(size = 12, family = "serif"))
+}
+
+calculate_cell_ratio <- function(seurat_obj, group_var = "group", colors) {
+  Cellratio <- prop.table(table(Idents(seurat_obj), seurat_obj@meta.data[[group_var]]), margin = 2)
+  Cellratio <- as.data.frame(Cellratio)
+  
+  p <- ggplot(Cellratio) + 
+    geom_bar(aes(x = factor(Var2), y = Freq, fill = Var1), stat = "identity",
+             width = 0.7, size = 0.5, colour = '#222222') + 
+    theme_classic() + labs(x = 'Group', y = 'Ratio') + scale_fill_manual(values = colors) +
+    theme(panel.border = element_rect(fill = NA, color = "black", size = 0.5, linetype = "solid"),
+          axis.title = element_text(size = 12), axis.text.x = element_text(size = 12))
+  return(p)
+}
+
+create_dotplot <- function(seurat_obj, features, group_by = "seurat_clusters") {
+  DotPlot(seurat_obj, features = features, group.by = group_by) + coord_flip() + theme_bw() +
+    theme(panel.grid = element_blank(), axis.text.x = element_text(hjust = 1, vjust = 0.5)) +
+    labs(x = NULL, y = NULL) + guides(size = guide_legend(order = 3)) +
+    scale_color_gradientn(values = seq(0, 1, 0.2), colours = c('#330066', '#336699', '#66CC66', '#FFCC33')) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+extract_subset_analysis <- function(seurat_obj, celltypes, subset_name, nfeatures = 2000, dims = 1:30) {
+  subset_obj <- subset(seurat_obj, celltype %in% celltypes)
+  subset_obj <- NormalizeData(subset_obj)
+  
+  s.genes <- Seurat::cc.genes.updated.2019$s.genes
+  g2m.genes <- Seurat::cc.genes.updated.2019$g2m.genes
+  subset_obj <- CellCycleScoring(object = subset_obj, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+  
+  subset_obj <- FindVariableFeatures(subset_obj, selection.method = "vst", nfeatures = nfeatures)
+  subset_obj <- ScaleData(subset_obj, verbose = FALSE)
+  subset_obj <- RunPCA(subset_obj, verbose = FALSE)
+  subset_obj <- RunHarmony(subset_obj, c("orig.ident"))
+  subset_obj <- RunUMAP(subset_obj, reduction = "harmony", dims = dims)
+  subset_obj <- FindNeighbors(subset_obj, reduction = "harmony", dims = dims)
+  subset_obj <- FindClusters(subset_obj, resolution = 0.9)
+  
+  saveRDS(subset_obj, paste0(subset_name, "_last.rds"))
+  return(subset_obj)
+}
+
+common_markers <- list(
+  t_cell = c("CD3D", "CD3E", "CD4", "CD8A", "CD8B", "CCR7", "SELL", "TCF7", "IL7R"),
+  b_cell = c("CD19", "MS4A1", "CD79A", "CD27", "CD38", "MZB1", "XBP1"),
+  nk_cell = c("NKG7", "NCAM1", "GNLY", "PRF1"),
+  monocyte = c("CD14", "FCGR3A", "CD68", "CD163", "FCN1", "LYZ"),
+  dendritic = c("LILRA4", "CD1C", "XCR1"),
+  platelet = c("PPBP", "PF4"),
+  neutrophil = c("FCGR3B", "CXCR2", "S100A8", "MPO"),
+  mast = c("TPSB2")
+)
+
+color_palettes <- list(
+  my36colors = c('#E5D2DD', '#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
+                 '#E95C59', '#E59CC4', '#AB3282', '#23452F', '#BD956A', '#8C549C', '#585658',
+                 '#9FA3A8', '#E0D4CA', '#5F3D69', '#C5DEBA', '#58A4C3', '#E4C755', '#F7F398',
+                 '#AA9A59', '#E63863', '#E39A35', '#C1E6F3', '#6778AE', '#91D0BE', '#B53E2B',
+                 '#712820', '#DCC1DD', '#CCE0F5', '#CCC9E6', '#625D9E', '#68A180', '#3A6963',
+                 '#968175'),
+  
+  newcolour = c("#FF5E33", "#FFBE7A", "#82B0D2", "#2878b5", "#c82423", "#f8ac8c", "#BEB8DC",
+               "#6A5ACD", "#D2B48C", "#FF336E", "#40E0D0", "#D2691E", "#8ECFC9", "#5F9EA0",
+               "#8A2BE2", "#8B008B", "#DEB887", "#c82423", "#ff8884", "#A1A9D0", "#9ac9db",
+               "#E7DAD2", "#F0988C", "#B883D4", "#9E9E9E", "#CFEAF1", "#C4A5DE", "#BEB8DC", "#98FB98")
+)
+
+analyze_markers <- function(seurat_obj, only_pos = TRUE, logfc_threshold = 0.4, min_pct = 0.1) {
+  markers <- FindAllMarkers(seurat_obj, only.pos = only_pos, 
+                           logfc.threshold = logfc_threshold, min.pct = min_pct)
+  return(markers)
+}
+
+create_heatmap <- function(seurat_obj, features, celltype_order) {
+  avg_exp <- AverageExpression(object = seurat_obj, assays = "RNA", 
+                              features = features, slot = "data")$RNA
+  avg_exp <- avg_exp[, celltype_order]
+  scaled_exp <- t(scale(t(avg_exp)))
+  
+  pheatmap(mat = scaled_exp, color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+           cluster_rows = FALSE, cluster_cols = FALSE, show_rownames = TRUE, 
+           show_colnames = TRUE, fontsize_row = 6, fontsize_col = 8, angle_col = 45,
+           border_color = NA, scale = "none", main = "Cell Type Marker Expression Heatmap",
+           clustering_distance_rows = "euclidean", clustering_method = "complete")
+}
+
+sample_composition_plot <- function(seurat_obj, sample_col = "orig.ident", color_palette) {
+  sample_table <- as.data.frame(table(seurat_obj@meta.data[[sample_col]], Idents(seurat_obj)))
+  names(sample_table) <- c("Samples", "celltype", "CellNumber")
+  
+  ggplot(sample_table, aes(x = Samples, weight = CellNumber, fill = celltype)) +
+    geom_bar(position = "fill") + scale_fill_manual(values = color_palette) + 
+    theme(panel.grid = element_blank(), 
+          panel.background = element_rect(fill = "transparent", colour = NA),
+          axis.line.x = element_line(colour = "black"), 
+          axis.line.y = element_line(colour = "black"),
+          axis.text.x = element_text(size = 14), 
+          axis.text.y = element_text(size = 14),
+          axis.title.x = element_text(size = 14), 
+          axis.title.y = element_text(size = 14),
+          legend.text = element_text(size = 12),
+          plot.title = element_text(lineheight = .8, face = "bold", hjust = 0.5, size = 12)) +
+    labs(y = "Percentage") + RotatedAxis()
+}
+
+rogue_analysis <- function(seurat_obj, cluster_col = "RNA_snn_res.0.5", sample_col = "orig.ident", n_cells = 1000) {
+  sce_sub <- seurat_obj %>% subset(., downsample = n_cells)
+  expr <- GetAssayData(sce_sub, slot = 'counts') %>% as.matrix()
+  meta <- sce_sub@meta.data
+  rogue(expr = expr, labels = meta[[cluster_col]], samples = meta[[sample_col]], 
+        platform = 'UMI', span = 0.6) %>% rogue.boxplot()
+}
+
+rename_clusters <- function(seurat_obj, new_ids, new_levels = NULL) {
+  names(new_ids) <- levels(seurat_obj)
+  seurat_obj <- RenameIdents(seurat_obj, new_ids)
+  if (!is.null(new_levels)) {
+    levels(seurat_obj) <- new_levels
+  }
+  seurat_obj@meta.data[["celltype_all"]] <- seurat_obj@active.ident
+  return(seurat_obj)
+}
+
+feature_plot_grid <- function(seurat_obj, features, ncol = 4, order = TRUE) {
+  FeaturePlot(object = seurat_obj, features = features, order = order) & 
+    theme(legend.position = "right") & 
+    plot_layout(ncol = ncol)
+}
+
+save_plots <- function(plot_obj, filename, width = 10, height = 8) {
+  ggsave(filename, plot_obj, width = width, height = height)
+}
+
+pSS_hamony <- process_pSS_data(pSS_hamony)
+
+markers <- analyze_markers(pSS_hamony)
+rogue_analysis(pSS_hamony)
+
+feature_plots <- feature_plot_grid(pSS_hamony, common_markers$t_cell)
+
+umap_plot <- plot_cell_umap(pSS_hamony, color_palettes$newcolour)
+save_plots(umap_plot, "pSS_umap.pdf")
+
+cell_ratio_plot <- calculate_cell_ratio(pSS_hamony, colors = color_palettes$newcolour)
+save_plots(cell_ratio_plot, "cell_ratio.pdf")
+
+sample_comp_plot <- sample_composition_plot(pSS_hamony, color_palette = color_palettes$newcolour)
+save_plots(sample_comp_plot, "sample_composition.pdf")
+
+new_cluster_ids <- c("TAL", "PT", "CNT_PC", "DCT", "FIB", "ENDO", "LEUK", "FR-PTC", "ICA", 
+                    "PEC", "PODO", "ATL", "ICB", "URO1", "URO2")
+new_levels <- c("PT", "FR-PTC", "PEC", "ATL", "TAL", "DCT", "CNT_PC", "ICA", "ICB", "PODO", 
+               "ENDO", "FIB", "LEUK", "URO1", "URO2")
+
+pSS_hamony <- rename_clusters(pSS_hamony, new_cluster_ids, new_levels)
+saveRDS(pSS_hamony, "pSS_hamony_processed.rds")
+
+Bcells <- extract_subset_analysis(pSS_hamony, c("B cells", "Plasma cells"), "Bcells", nfeatures = 1000, dims = 1:40)
+CD4T <- extract_subset_analysis(pSS_hamony, c("CD4+ T", "Naive CD4+ T"), "CD4T")
+CD8T <- extract_subset_analysis(pSS_hamony, "CD8+ T", "CD8T")
+
+bcell_markers <- c("CD19", "MS4A1", "IL4R", "TCL1A", "FCER2", "FCMR", "SELL", "CD27", "LY86", 
+                  "BLK", "LTB", "BANK1", "CCR7", "NFKBID", "DUSP4", "CD82", "CD86", "ISG15", 
+                  "CAPG", "CD69", "CD83", "NR4A2", "HLA-DPB1", "HLA-DRA1", "HLA-DPA1", "CD74")
+
+cd4t_markers <- c("CCR7", "SELL", "TCF7", "IL7R", "CXCR5", "BCL6", "PDCD1", "FOXP3", 
+                 "IL2RA", "CTLA4", "GATA3", "RORC", "IL17A", "TBX21", "IFNG")
+
+cd8t_markers <- c("CCR7", "SELL", "S100A8", "IL7R", "TCF7", "GZMK", "GZMA", "GZMB", 
+                 "NKG7", "PRF1", "CD44", "EOMES", "PDCD1", "LAG3", "HAVCR2")
+
+bcell_dotplot <- create_dotplot(Bcells, bcell_markers)
+cd4t_dotplot <- create_dotplot(CD4T, cd4t_markers)
+cd8t_dotplot <- create_dotplot(CD8T, cd8t_markers)
+
+save_plots(bcell_dotplot, "bcell_markers.pdf", width = 12, height = 10)
+save_plots(cd4t_dotplot, "cd4t_markers.pdf", width = 12, height = 8)
+save_plots(cd8t_dotplot, "cd8t_markers.pdf", width = 12, height = 8)
+
+
+# Subset B cells and plasma cells
+pSS_hamony$celltype <- Idents(pSS_hamony)
+Bcells <- subset(pSS_hamony, celltype %in% c("B cells", "Plasma cells"))
+
+# Normalize data
+Bcells <- NormalizeData(Bcells)
+
+# Load cell cycle genes
+s.genes <- readRDS("/home/xuh/scRNA_DSS/mouse_cellcyclegene/s.genes.rds")
+g2m.genes <- readRDS("/home/xuh/scRNA_DSS/mouse_cellcyclegene/g2m.genes.rds")
+s.genes <- s.genes$MGI.symbol
+g2m.genes <- g2m.genes$MGI.symbol
+
+# Cell cycle scoring
+Bcells <- CellCycleScoring(object = Bcells, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# Harmony integration
+Bcells <- FindVariableFeatures(Bcells, selection.method = "vst", nfeatures = 1000)
+Bcells <- ScaleData(Bcells, verbose = FALSE)
+Bcells <- RunPCA(Bcells, verbose = FALSE)
+Bcells <- RunHarmony(Bcells, c("orig.ident"))
+
+# Dimensionality reduction and clustering
+ElbowPlot(Bcells, ndims = 50)
+Bcells <- RunUMAP(Bcells, reduction = "harmony", dims = 1:40)
+Bcells <- FindNeighbors(Bcells, reduction = "harmony", dims = 1:40)
+Bcells <- FindClusters(Bcells, resolution = 1.5)
+
+# Visualization plots
+DimPlot(Bcells, label = TRUE, raster = FALSE, split.by = "disease")
+DimPlot(Bcells, label = TRUE, raster = FALSE, split.by = "tissue")
+DimPlot(Bcells, label = TRUE, split.by = "seurat_clusters")
+p1 <- DimPlot(Bcells, label = TRUE)
+ggsave("umapBcell.pdf", p1)
+
+# Marker gene analysis
+markers <- c("CD19", "MS4A1", "IL4R", "TCL1A", "FCER2", "FCMR", "SELL", 
+             "CD27", "LY86", "BLK", "LTB", "BANK1", "CCR7", "NFKBID",
+             "DUSP4", "CD82", "CD86", "ISG15", "CAPG", "CD69", "CD83", 
+             "NR4A2", "HLA-DPB1", "HLA-DRA1", "HLA-DPA1", "CD74", "SUGCT", 
+             "BCL6", "SSBP2", "STAG3", "RGS13", "LCK", "H4C3", "VPREB3", 
+             "STMN1", "HMGB2", "EIF6", "PSMA7", "MT1X", "MT2A", "MT1E",
+             "IGKC", "IGHM", "IGHD", "IGHA1", "IGHA2", "IGHG1", "IGHG2", 
+             "IGLC2", "MZB1", "DERL3", "FKBP11", "PRDX4", "TMED2", "DPP7", 
+             "FIS1", "FOS", "DUSP1", "HSPB1", "CD3D", "CD3E", "NKG7")
+
+# Alternative marker sets
+markers_set2 <- c("TXNIP", "FCER2", "FCMR", "SELL", "BANK1", "EGR1", "CD69", 
+                  "DUSP2", "JUN", "IL6", "CCND2", "MIR155HG", "PSME2", "BHLHE40", 
+                  "PARVB", "EB13", "BCL2A1", "LMO2", "GMDS", "PRPSAP2", "SERPIN49", 
+                  "MARCKSL1", "CD27", "CD38", "BCL6", "SUGCT", "EZR", "ISG20",
+                  "AICDA", "FCRL3", "FCRL2", "LINCO1857", "SAMSN1", "SIGLEC10", 
+                  "RASSF6", "FRZB", "HOPX", "BTNL9", "FGFR1", "IGHVDJxum", 
+                  "JCHAIN", "PRDM1", "XBP1", "MTB1", "SSR4", "GPR183", "CD44", 
+                  "KLF2", "TNFRSF13B", "VIM", "PLAC8", "FCRL4", "CCR1", "ITGAX",
+                  "HMGB2", "TUBATB", "MKI67", "UBE2C", "AURKB")
+
+markers_set3 <- c("TXNDC5", "NME2", "PPIB", "RGS13", "VPREB3", "HLA-DRB5", 
+                  "GADD45A", "CDKN1A", "DUSP5", "HSPA1A", "HSPA1B", "DNAJB1", 
+                  "NEAT1", "CPEB4", "AHNAK", "SLC3A2", "DDIT4", "CCPG1", "CD74", 
+                  "HLA-DRA", "CD37", "CD83", "IF16", "ISG15", "IFITM1", "ATP5E", 
+                  "ATP5L", "IGHA1", "TMEM59", "SPINK2", "TNFRSF18")
+
+# Top marker genes analysis
+top10_genes <- markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC), .by_group = TRUE) %>%
+  slice_head(n = 5)
+
+genes <- unique(top10_genes$gene)
+
+p1 <- DotPlot(Bcells, features = genes) + 
+  coord_flip() +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        axis.text.x = element_text(hjust = 1, vjust = 0.5)) +
+  labs(x = NULL, y = NULL) +
+  guides(size = guide_legend(order = 3)) +
+  scale_color_gradientn(values = seq(0, 1, 0.2), 
+                       colours = c('#330066', '#336699', '#66CC66', '#FFCC33')) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("markers.pdf", p1, height = 14, width = 7)
+
+# Heatmap visualization
+AverageHeatmap(object = Bcells, markerGene = markers, colseed = 127)
+
+# SCpubr dot plot
+pdf(file = "Dotplot_30_10_res2.pdf", width = 20, height = 12)
+do_DotPlot(sample = Bcells, assay = "RNA", features = markers, 
+           sequential.palette = "YlOrBr", legend.length = 50, 
+           legend.framewidth = 2, font.size = 14, group.by = "seurat_clusters",
+           dot.scale = 6, cluster = TRUE)
+dev.off()
+
+# Re-analysis with cell type annotations
+Bcells$cell_type <- Idents(Bcells)
+Bcells <- FindVariableFeatures(Bcells, selection.method = "vst", nfeatures = 1000)
+Bcells <- ScaleData(Bcells, verbose = FALSE)
+Bcells <- RunPCA(Bcells, verbose = FALSE)
+Bcells <- RunHarmony(Bcells, c("orig.ident"))
+
+ElbowPlot(Bcells, ndims = 50)
+Bcells <- RunUMAP(Bcells, reduction = "harmony", dims = 1:40)
+Bcells <- FindNeighbors(Bcells, reduction = "harmony", dims = 1:40)
+Bcells <- FindClusters(Bcells, resolution = 1.5)
+
+# Final visualization
+DimPlot(Bcells, label = TRUE, raster = FALSE, split.by = "disease")
+DimPlot(Bcells, label = TRUE, raster = FALSE, split.by = "tissue")
+DimPlot(Bcells, label = TRUE, split.by = "seurat_clusters")
+DimPlot(Bcells, label = TRUE, group.by = "cell_type")
+DimPlot(Bcells, label = TRUE)
+
+# Set identities and save
+Idents(Bcells) <- Bcells$cell_type
+saveRDS(Bcells, "Bcellslast.rds")
+
+# Clean cell type names
+Bcells$cell_types <- str_replace_all(Bcells$cell_types, pattern = "\\(.*", replacement = "")
+
+
+
+
+
+
+
+
+
+
+# Subset CD4+ T cells
+CD4T <- subset(pSS_hamony, celltype %in% c("CD4+ T", "Naive CD4+ T"))
+
+# Normalize data and cell cycle scoring
+CD4T <- NormalizeData(CD4T)
+s.genes <- Seurat::cc.genes.updated.2019$s.genes
+g2m.genes <- Seurat::cc.genes.updated.2019$g2m.genes
+CD4T <- CellCycleScoring(object = CD4T, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# Harmony integration and clustering
+CD4T <- FindVariableFeatures(CD4T, selection.method = "vst", nfeatures = 2000)
+CD4T <- ScaleData(CD4T, verbose = FALSE)
+CD4T <- RunPCA(CD4T, verbose = FALSE)
+CD4T <- RunHarmony(CD4T, c("orig.ident"))
+
+# Dimensionality reduction
+ElbowPlot(CD4T, ndims = 50)
+CD4T <- RunUMAP(CD4T, reduction = "harmony", dims = 1:30)
+CD4T <- FindNeighbors(CD4T, reduction = "harmony", dims = 1:30)
+CD4T <- FindClusters(CD4T, resolution = 0.9)
+
+# Visualization
+DimPlot(CD4T, label = TRUE, raster = FALSE, split.by = "disease")
+DimPlot(CD4T, label = TRUE, raster = FALSE, split.by = "tissue")
+DimPlot(CD4T, label = TRUE, split.by = "seurat_clusters")
+DimPlot(CD4T, label = TRUE)
+
+
+# CD4+ T cell marker genes
+cd4_features <- c("CCR7", "LEF1", "TCF7", "KLRB1", "CXCR5", "SELL", "IL7R",
+                  "KLRG1", "GZMK", "CCL5", "DUSP2", "CXCR3", "CXCL13", "TBX21",
+                  "IFNG", "STAT1", "STAT4", "FOXP3", "IL2RA", "CTLA4", "GATA3",
+                  "STAT6", "DEC2", "MAF", "IL4", "IL5", "IL13", "GZMA", "GZMB",
+                  "NKG7", "PRF1", "AC016831.7", "ADAM19", "XIST", "RORA", "RORC",
+                  "IL17A", "CCR6", "LGALS1", "TIGIT", "LAG3", "HAVCR2", "BTLA",
+                  "GRAIL", "CBL-B", "ITCH", "NEDD4")
+
+# Dot plot visualization
+DotPlot(CD4T, features = cd4_features) + coord_flip() +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        axis.text.x = element_text(hjust = 1, vjust = 0.5)) +
+  labs(x = NULL, y = NULL) +
+  guides(size = guide_legend(order = 3)) +
+  scale_color_gradientn(values = seq(0, 1, 0.2), 
+                       colours = c('#330066', '#336699', '#66CC66', '#FFCC33')) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5))
+
+# T cell marker gene lists
+cell_markers <- list(
+  `Naive T cells` = c("CCR7", "SELL", "TCF7", "IL7R", "GPR183", "LEF1", "LTB"),
+  `Central Memory T cells` = c("CCR7", "HSPA6", "MT1E", "MT1F", "CLDND1", "CD69", "GPR183", "IL7R", "KLF2", "TOB1"),
+  `Effector Memory T cells` = c("RPS19", "DUSP2", "CD44"),
+  `Th1-like T cells` = c("UCP2", "APCB1B", "TBX21", "IFNG"),
+  `Th17-like T cells` = c("LINC00513", "AC016831.7", "ADAM19", "XIST", "RORA", "IL17A", "IL17F", "RORC", "IL23R", "CTSH", "CAGC"),
+  `Tfh` = c("CXCL13", "CTLA4", "BATE", "PDCD1", "ICOS", "TNFRSF8", "BCL6", "TOX"),
+  `Treg` = c("FOXP3", "IL2RA", "CTLA4", "TIGIT", "TNFRSF18", "MAGEH1", "SAT1", "CCR8", "KZF2", "IL10", "BATF"),
+  `Naive CD8 T cells` = c("CCR7", "SELL", "S100A8", "CST3", "AC020916.1", "IL7R", "LEF1", "TCF7"),
+  `Central Memory CD8 T cells` = c("CLND1", "RPS26", "GZMK", "CD44", "EOMES", "CD28", "CCR7", "DKK3"),
+  `Effector Memory CD8 T cells` = c("DUSP2", "GZMK", "CX3CR1"),
+  `Teff` = c("FGFBP2", "CX3CR1", "FCGR3A", "XLRG1", "IFNG", "GZMB", "GZMH", "PRF1", "NKG7", "GNLY"),
+  `Trm` = c("XCL1", "XCL2", "IL7R", "PRDM1", "TGFBR2", "ITGAL"),
+  `Tex` = c("CXCL13", "TIGIT", "CTLA4", "PDCD1", "LAG3", "HAVCR2", "ENTPD1", "TOX", "TOX2", "LAYN", "TNFRSF9"),
+  `Temma` = c("FGFBP2", "ADGRG1", "FCGR3A"),
+  `Cytotoxic` = c("NKG7", "PRF1", "GZMK", "GZMA", "GZMB", "GZMH", "IFNG"),
+  `TSTR` = c("HSPA1A", "HSPA1B"),
+  `p-TEX` = c("TCF7", "CD27", "CD28", "EOMES"),
+  `NKT cells` = c("EOMES", "XCL1", "XCL2", "CXCR6", "TIGIT", "LAG3"),
+  `MAIT cells` = c("TRAV1-2", "SLC4A10", "GZMK", "KLRB1", "RORC", "RORA"),
+  `IEL` = c("CD160", "KIR2DL4", "TMIGD2", "ITGAE"),
+  `DNT` = c("GZMK")
+)
+
+# T cell state markers
+t_cell_states <- list(
+  `Naive` = c("CCR7", "SELL", "IL7R", "TCF7", "LEF1", "LTB", "FOXO1", "GZMK"),
+  `Activation` = c("SELL", "CD40LG", "ANXA1", "IL2RA", "CD69"),
+  `Memory` = c("CCR7", "TCF7", "CD69", "NR4A1", "MYADM", "GATA3", "TBX21"),
+  `Effector` = c("BATF3", "IL2RA", "IFNG", "IRF4", "MYC", "SLC7A5", "SLC7A1", "XCL1", "GZMB", "CCL3", "CCL4", "IL2", "PRF1", "NKG7", "GNLY"),
+  `Tolerant` = c("EGR2", "IKZF2", "IZUMO1R", "CD200", "DGKZ", "BTLA", "TOX", "CTLA4"),
+  `Exhausted` = c("PDCD1", "LAG3", "HAVCR2", "CD244", "CD160", "IL10R", "EOMES", "NR4A2", "PTGER4", "TOX", "TOX2", "TIGIT", "CTLA4", "ENTPD1"),
+  `Proliferation` = c("MKI67", "TK1", "STMN1"),
+  `Cytotoxicity` = c("GZMK", "GZMA", "GZMB", "NKG7", "PRF1", "IFNG", "GNLY"),
+  `Regulatory` = c("FOXP3", "IL2RA", "CTLA4", "TIGIT", "TNFRSF18", "IL10", "IKZF2", "CCR8"),
+  `Early Memory` = c("CCR2", "CX3CR1", "IL1RRAP", "ZEB2")
+)
+
+# Test specific marker sets
+DotPlot(CD4T, features = t_cell_states$Effector)
+DotPlot(CD4T, features = cell_markers$`Central Memory T cells`)
+
+
+CD4T <- RenameIdents(CD4T, `CD4-c2(CXCR5 Tfh)` = "CD4-c2(CXCR5 Tfh-like)")
+
+# Save processed data
+saveRDS(CD4T, "CD4T_last.rds")
+
+# Final subset and re-analysis
+CD4T_final <- subset(CD4T, celltype %in% c("CD4-c0(CCR7 Tn)", "CD4-c1(CCR7 Tn)", "CD4-c2(CXCR5 Tfh-like)", 
+                                           "CD4-c3(IL7R Tcm)", "CD4-c4(GMZK Tem)", "CD4-c5(CXCR3 Th1)",
+                                           "CD4-c6(FOXP3 Treg)", "CD4-c7(FOXP3 Treg-Prog)", "CD4-c8(GATA3 Th2)",
+                                           "CD4-c9(CCR7 Tcm)", "CD4-c10(Th1-like)", "CD4-c11(RORA Th17)",      
+                                           "CD4-c13(LGALS1 T)"))
+
+CD4T_final <- FindVariableFeatures(CD4T_final, selection.method = "vst", nfeatures = 2000)
+CD4T_final <- ScaleData(CD4T_final, verbose = FALSE)
+CD4T_final <- RunPCA(CD4T_final, verbose = FALSE)
+CD4T_final <- RunHarmony(CD4T_final, c("orig.ident"))
+
+ElbowPlot(CD4T_final, ndims = 50)
+CD4T_final <- RunUMAP(CD4T_final, reduction = "harmony", dims = 1:30)
+CD4T_final <- FindNeighbors(CD4T_final, reduction = "harmony", dims = 1:30)
+CD4T_final <- FindClusters(CD4T_final, resolution = 0.9)
+
+# Final visualization
+DimPlot(CD4T_final, label = TRUE, raster = FALSE, split.by = "disease")
+DimPlot(CD4T_final, label = TRUE, raster = FALSE, split.by = "tissue")
+DimPlot(CD4T_final, label = TRUE, split.by = "seurat_clusters")
+DimPlot(CD4T_final, label = TRUE)
+
+# Cell ratio analysis
+Cellratio <- prop.table(table(Idents(CD4T_final), CD4T_final$group), margin = 2)
+Cellratio <- as.data.frame(Cellratio)
+
+my36colors <- c('#E5D2DD', '#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
+                '#E95C59', '#E59CC4', '#AB3282', '#23452F', '#BD956A', '#8C549C', '#585658',
+                '#9FA3A8', '#E0D4CA', '#5F3D69', '#C5DEBA', '#58A4C3', '#E4C755', '#F7F398',
+                '#AA9A59', '#E63863', '#E39A35', '#C1E6F3', '#6778AE', '#91D0BE', '#B53E2B',
+                '#712820', '#DCC1DD', '#CCE0F5', '#CCC9E6', '#625D9E', '#68A180', '#3A6963',
+                '#968175')
+
+p <- ggplot(Cellratio) + 
+  geom_bar(aes(x = factor(Var2), y = Freq, fill = Var1), stat = "identity",
+           width = 0.7, size = 0.5, colour = '#222222') + 
+  theme_classic() + labs(x = 'Group', y = 'Ratio') + scale_fill_manual(values = my36colors) +
+  theme(panel.border = element_rect(fill = NA, color = "black", size = 0.5, linetype = "solid"),
+        axis.title = element_text(size = 12), axis.text.x = element_text(size = 12))
+
+# Final UMAP plot
+DimPlot(CD4T_final, label = TRUE, repel = TRUE, cols = my36colors)
+
+
+
+
+
+
+# Subset CD8+ T cells
+CD8T <- subset(pSS_hamony, celltype %in% c("CD8+ T"))
+
+# Normalize data and cell cycle scoring
+CD8T <- NormalizeData(CD8T)
+s.genes <- Seurat::cc.genes.updated.2019$s.genes
+g2m.genes <- Seurat::cc.genes.updated.2019$g2m.genes
+CD8T <- CellCycleScoring(object = CD8T, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# Harmony integration and clustering
+CD8T <- FindVariableFeatures(CD8T, selection.method = "vst", nfeatures = 2000)
+CD8T <- ScaleData(CD8T, verbose = FALSE)
+CD8T <- RunPCA(CD8T, verbose = FALSE, npcs = 50)
+CD8T <- RunHarmony(CD8T, c("orig.ident"), kmeans_init_nstart = 20, kmeans_init_iter_max = 100)
+
+# Convert to AnnData format for Python compatibility
+if (requireNamespace("sceasy", quietly = TRUE)) {
+  sceasy::convertFormat(CD8T, from = "seurat", to = "anndata", assay = "RNA",
+                       outFile = './CD8T.h5ad')
+}
+
+# Dimensionality reduction and clustering
+ElbowPlot(CD8T, ndims = 50)
+CD8T <- RunUMAP(CD8T, reduction = "harmony", dims = 1:15)
+CD8T <- FindNeighbors(CD8T, reduction = "harmony", dims = 1:15)
+CD8T <- FindClusters(CD8T, resolution = c(1.0, 1.5))
+
+# Visualization
+DimPlot(CD8T, label = TRUE, raster = FALSE, split.by = "disease")
+DimPlot(CD8T, label = TRUE, raster = FALSE, split.by = "tissue")
+DimPlot(CD8T, label = TRUE, split.by = "seurat_clusters")
+DimPlot(CD8T, label = TRUE)
+
+# CD8+ T cell marker gene lists
+cd8_markers <- list(
+  `Naive T cells` = c("CCR7", "SELL", "S100A8", "CST3", "AC020916.1", "IL7R", "LEF1", "TCF7"),
+  `Central Memory T cells` = c("CLND1", "RPS26", "GZMK", "CD44", "EOMES", "CD28", "CCR7", "DKK3", "TCF7", "IL7R"),
+  `Effector Memory T cells` = c("DUSP2", "GZMK", "CX3CR1"),
+  `Teff` = c("FGFBP2", "CX3CR1", "FCGR3A", "XLRG1", "IFNG", "GZMB", "GZMH", "PRF1", "NKG7", "GNLY"),
+  `Trm` = c("XCL1", "XCL2", "IL7R", "PRDM1", "TGFBR2", "ITGAL"),
+  `Tex` = c("CXCL13", "TIGIT", "CTLA4", "PDCD1", "LAG3", "HAVCR2", "ENTPD1", "TOX", "TOX2", "LAYN", "TNFRSF9"),
+  `Temma` = c("FGFBP2", "ADGRG1", "FCGR3A"),
+  `Cytotoxic` = c("NKG7", "PRF1", "GZMK", "GZMA", "GZMB", "GZMH", "IFNG"),
+  `TSTR` = c("HSPA1A", "HSPA1B"),
+  `p-TEX` = c("TCF7", "CD27", "CD28", "EOMES"),
+  `NKT cells` = c("EOMES", "XCL1", "XCL2", "CXCR6", "TIGIT", "LAG3"),
+  `MAIT cells` = c("TRAV1-2", "SLC4A10", "GZMK", "KLRB1", "RORC", "RORA"),
+  `IEL` = c("CD160", "KIR2DL4", "TMIGD2", "ITGAE"),
+  `DNT` = c("GZMK")
+)
+
+# T cell state markers
+t_cell_states <- list(
+  `Naive` = c("CCR7", "SELL", "IL7R", "TCF7", "LEF1", "LTB", "FOXO1", "GZMK"),
+  `Activation` = c("SELL", "CD40LG", "ANXA1", "IL2RA", "CD69"),
+  `Memory` = c("CCR7", "TCF7", "CD69", "NR4A1", "MYADM", "GATA3", "TBX21"),
+  `Effector` = c("BATF3", "IL2RA", "IFNG", "IRF4", "MYC", "SLC7A5", "SLC7A1", "XCL1", "GZMB", "CCL3", "CCL4", "IL2", "PRF1", "NKG7", "GNLY"),
+  `Tolerant` = c("EGR2", "IKZF2", "IZUMO1R", "CD200", "DGKZ", "BTLA", "TOX", "CTLA4"),
+  `Exhausted` = c("PDCD1", "LAG3", "HAVCR2", "CD244", "CD160", "IL10R", "EOMES", "NR4A2", "PTGER4", "TOX", "TOX2", "TIGIT", "CTLA4", "ENTPD1"),
+  `Proliferation` = c("MKI67", "TK1", "STMN1"),
+  `Cytotoxicity` = c("GZMK", "GZMA", "GZMB", "NKG7", "PRF1", "IFNG", "GNLY"),
+  `Regulatory` = c("FOXP3", "IL2RA", "CTLA4", "TIGIT", "TNFRSF18", "IL10", "IKZF2", "CCR8"),
+  `Early Memory` = c("CCR2", "CX3CR1", "IL1RRAP", "ZEB2")
+)
+
+# Marker gene analysis
+DotPlot(CD8T, features = cd8_markers$`Naive T cells`)
+DotPlot(CD8T, features = cd8_markers$`Central Memory T cells`)
+DotPlot(CD8T, features = cd8_markers$`Effector Memory T cells`)
+DotPlot(CD8T, features = cd8_markers$Cytotoxic)
+DotPlot(CD8T, features = cd8_markers$Teff)
+
+# Custom marker sets
+cd8_specific_markers <- c("CCR7", "SELL", "FCGR3A", "FGFBP2", "NKG7", "PRF1", 
+                          "GZMK", "GZMA", "GZMB", "GZMH", "IFNG", "TCF7", 
+                          "CD69", "NR4A1", "MYADM", "GATA3", "TBX21", "CD44",
+                          "KLRG1", "GPR183", "S100A8")
+
+# Set cluster identities
+Idents(CD8T) <- CD8T$seurat_clusters
+
+# Color palette for visualization
+my36colors <- c('#53A85F', '#F1BB72', '#F3B1A0', '#D6E7A3', '#57C3F3', '#476D87',
+                '#E95C59', '#E59CC4', '#AB3282', '#23452F', '#BD956A', '#8C549C', 
+                '#585658', '#9FA3A8', '#E0D4CA', '#5F3D69', '#C5DEBA', '#58A4C3', 
+                '#E4C755', '#F7F398', '#AA9A59', '#E63863', '#E39A35', '#C1E6F3', 
+                '#6778AE', '#91D0BE', '#B53E2B', '#712820', '#DCC1DD', '#9bc7f6ff', 
+                '#E5D2DD', '#CCC9E6', '#625D9E', '#68A180', '#3A6963', '#968175')
+
+# UMAP visualization
+DimPlot(CD8T, label = TRUE, repel = TRUE, cols = my36colors)
+
+# Comprehensive CD8+ T cell markers
+cd8_features <- c("AC020916.1", "ADGRG1", "CD28", "CD44", "CCR7", "CLND1", "CST3",
+                  "CTLA4", "CX3CR1", "CXCL13", "DKK3", "DUSP2", "ENTPD1", "EOMES",
+                  "FCGR3A", "FGFBP2", "GZMA", "GZMB", "GZMH", "GZMK", "GNLY", "HAVCR2",
+                  "IFNG", "IL7R", "LAG3", "LAYN", "LEF1", "NKG7", "PDCD1", "PRF1", "RPS26",
+                  "S100A8", "SELL", "TCF7", "TIGIT", "TNFRSF9", "TOX", "TOX2", "XLRG1")
+
+# Top marker genes analysis (assuming markers object exists)
+if (exists("markers")) {
+  top_markers <- markers %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::top_n(n = 6, wt = avg_log2FC)
+  
+  # Average heatmap
+  p1 <- AverageHeatmap(object = CD8T, markerGene = top_markers, showRowNames = TRUE)
+  print(p1)
+}
+
+# Save processed data
+saveRDS(CD8T, "CD8T_processed.rds")
+
+
+
+# Final visualization with cluster names
+DimPlot(CD8T, label = TRUE, repel = TRUE, cols = my36colors) + 
+  theme(legend.position = "right")
+
+# Cell type proportion analysis
+cell_ratio <- prop.table(table(Idents(CD8T), CD8T$group), margin = 2)
+cell_ratio_df <- as.data.frame(cell_ratio)
+
+# Dot plot for key markers
+DotPlot(CD8T, features = cd8_features) + 
+  coord_flip() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save final object
+CD8T$cd8_celltype <- Idents(CD8T)
+saveRDS(CD8T, "CD8T_final.rds")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Load required packages
+library(scRepertoire)
+library(immunarch)
+library(Seurat)
+library(tibble)
+library(tidyr)
+library(RColorBrewer)
+library(scales)
+library(ggpubr)
+library(ggplot2)
+library(ggsci)
+
+# BCR Analysis Section
+
+# Sample and group information
+sample <- c("N1", "N2", "N3", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", 
+           "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P17", "P18")
+
+group <- c("NC", "NC", "NC", "pSS", "pSS", "pSS", "pSS", "pSS", "pSS", "pSS", 
+          "pSS", "pSS", "pSS", "pSS", "pSS", "pSS", "pSS", "pSS", "pSS", "pSS", "pSS")
+
+# Create BCR list and combine data
+BCR_list <- list(N1, N2, N3, P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, 
+                P11, P12, P13, P14, P15, P16, P17, P18)
+
+data_bcr <- combineBCR(BCR_list, ID = sample, samples = group, threshold = 0.85)
+data_bcr <- addVariable(data_bcr, name = "Group", variables = group)
+
+# BCR Visualization Functions
+create_bcr_plots <- function(data_bcr) {
+  plots <- list()
+  
+  # Quantify contigs
+  plots$p1 <- quantContig(data_bcr, cloneCall = "strict", scale = TRUE, chain = "both") +
+    scale_color_rickandmorty() +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1))
+  
+  plots$p2 <- quantContig(data_bcr, cloneCall = "strict", scale = TRUE, chain = "IGL") +
+    scale_color_rickandmorty() +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1))
+  
+  # Abundance plots
+  plots$p3 <- abundanceContig(data_bcr, cloneCall = "strict", scale = FALSE)
+  plots$p4 <- abundanceContig(data_bcr, cloneCall = "strict", scale = FALSE, group.by = 'sample')
+  
+  # Length distribution
+  plots$p5 <- lengthContig(data_bcr, cloneCall = "aa", chain = "both")
+  
+  # Compare clonotypes
+  plots$p6 <- compareClonotypes(data_bcr, numbers = 5, cloneCall = "strict", graph = "alluvial") +
+    scale_colour_brewer(palette = "Greens")
+  
+  # Gene usage analysis
+  plots$p8 <- vizGenes(data_bcr, gene = "V", chain = "IGL", plot = "bar", 
+                      order = "variance", scale = TRUE)
+  
+  # Heatmap of V-J usage
+  plots$p9 <- vizGenes(data_bcr[1:5], gene = "V", chain = "IGL", y.axis = "J", 
+                      plot = "heatmap", scale = TRUE, order = "gene")
+  
+  plots$p10 <- vizGenes(data_bcr[6:8], gene = "V", chain = "IGL", y.axis = "J", 
+                       plot = "heatmap", scale = TRUE, order = "gene")
+  
+  plots$p11 <- vizGenes(data_bcr[9:12], gene = "V", chain = "IGL", y.axis = "J", 
+                        plot = "heatmap", scale = TRUE, order = "gene")
+  
+  # Clonal homeostasis
+  plots$p12 <- clonalHomeostasis(data_bcr, cloneCall = "aa", 
+                                cloneTypes = c(Rare = 1e-04, Small = 0.001, Medium = 0.01, 
+                                             Large = 0.1, Hyperexpanded = 1))
+  
+  plots$p13 <- clonalHomeostasis(data_bcr, cloneCall = "aa", 
+                                cloneTypes = c(Rare = 1e-04, Small = 0.001, Medium = 0.01, 
+                                             Large = 0.1, Hyperexpanded = 1),
+                                group.by = 'sample')
+  
+  # Clonal proportion
+  plots$p14 <- clonalProportion(data_bcr, cloneCall = "gene",
+                               split = c(10, 100, 1000, 10000, 30000, 1e+05))
+  
+  # Clonal overlap
+  plots$p15 <- clonalOverlap(data_bcr, cloneCall = "strict", method = "morisita")
+  
+  # Clone size distribution
+  plots$p16 <- clonesizeDistribution(data_bcr, cloneCall = "strict", method = "ward.D2")
+  
+  # Clonal diversity
+  plots$p17 <- clonalDiversity(data_bcr, cloneCall = "aa", n.boots = 1000, 
+                              x.axis = 'sample', group = 'ID')
+  
+  return(plots)
+}
+
+# Generate BCR plots
+bcr_plots <- create_bcr_plots(data_bcr)
+
+# Save BCR plots
+for (i in seq_along(bcr_plots)) {
+  plot_name <- paste0("bcr_plot_", i, ".pdf")
+  ggsave(plot_name, bcr_plots[[i]], width = 10, height = 8)
+}
+
+# TCR Analysis Section
+
+# Read TCR contig files
+# Create TCR list and process barcodes
+TCR_list <- list(N1, N2, N3, P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, 
+                P11, P12, P13, P14, P15, P16, P17, P18)
+
+# Strip barcode prefixes
+for (i in seq_along(TCR_list)) {
+  TCR_list[[i]] <- stripBarcode(TCR_list[[i]], column = 1, connector = "_", num_connects = 3)
+}
+
+# Combine TCR data
+combined <- combineTCR(TCR_list, samples = group, ID = sample, cells = "T-AB")
+
+# TCR Visualization Functions
+create_tcr_plots <- function(combined) {
+  plots <- list()
+  
+  # Quantify contigs
+  plots$quant_gene_nt <- quantContig(combined, cloneCall = "gene+nt", scale = TRUE)
+  plots$quant_gene_group <- quantContig(combined, cloneCall = "gene", group = "ID", scale = TRUE)
+  
+  # Compare clonotypes
+  plots$compare_samples <- compareClonotypes(combined, numbers = 10, 
+                                            samples = c("PX_P", "PX_T"), 
+                                            cloneCall = "aa", graph = "alluvial")
+  
+  plots$compare_all <- compareClonotypes(combined, numbers = 5, 
+                                       cloneCall = "strict", graph = "alluvial") +
+    scale_colour_brewer(palette = "Greens")
+  
+  return(plots)
+}
+
+# Generate TCR plots
+tcr_plots <- create_tcr_plots(combined)
+
+# Save TCR plots
+for (i in seq_along(tcr_plots)) {
+  plot_name <- paste0("tcr_plot_", i, ".pdf")
+  ggsave(plot_name, tcr_plots[[i]], width = 10, height = 8)
+}
+
+# Save processed data
+saveRDS(data_bcr, "BCR_processed_data.rds")
+saveRDS(combined, "TCR_processed_data.rds")
+
+# Print session information
+sessionInfo()
